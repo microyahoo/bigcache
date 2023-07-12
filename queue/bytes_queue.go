@@ -26,10 +26,10 @@ type BytesQueue struct {
 	array        []byte
 	capacity     int
 	maxCapacity  int
-	head         int
-	tail         int
-	count        int
-	rightMargin  int
+	head         int // 起始位置
+	tail         int // 下次可以插入 item 的位置
+	count        int // 数据条目个数
+	rightMargin  int // 用于标识队列中最后一个元素的位置，是一个绝对位置
 	headerBuffer []byte
 	verbose      bool
 }
@@ -39,9 +39,9 @@ type queueError struct {
 }
 
 // getNeededSize returns the number of bytes an entry of length need in the queue
-func getNeededSize(length int) int {
+func getNeededSize(length int) int { // 先用边长记录数据长度，然后写入数据
 	var header int
-	switch {
+	switch { // 数据长度不同，占用的字节数也不同，占用1-5个字节
 	case length < 127: // 1<<7-1
 		header = 1
 	case length < 16382: // 1<<14-2
@@ -86,20 +86,21 @@ func (q *BytesQueue) Reset() {
 // Push copies entry at the end of queue and moves tail pointer. Allocates more space if needed.
 // Returns index for pushed data or error if maximum size queue limit is reached.
 func (q *BytesQueue) Push(data []byte) (int, error) {
-	neededSize := getNeededSize(len(data))
+	neededSize := getNeededSize(len(data)) // 计算需要的空间
 
-	if !q.canInsertAfterTail(neededSize) {
-		if q.canInsertBeforeHead(neededSize) {
+	if !q.canInsertAfterTail(neededSize) { // 如果 tail 没有足够的空间插入
+		if q.canInsertBeforeHead(neededSize) { // 如果 head 有足够的空间
 			q.tail = leftMarginIndex
 		} else if q.capacity+neededSize >= q.maxCapacity && q.maxCapacity > 0 {
 			return -1, &queueError{"Full queue. Maximum size limit reached."}
 		} else {
+			// 尝试扩容
 			q.allocateAdditionalMemory(neededSize)
 		}
 	}
 
-	index := q.tail
-
+	index := q.tail // 保存插入前的位置
+	// 如果 tail 后面有足够的空间
 	q.push(data, neededSize)
 
 	return index, nil
@@ -119,12 +120,12 @@ func (q *BytesQueue) allocateAdditionalMemory(minimum int) {
 	q.array = make([]byte, q.capacity)
 
 	if leftMarginIndex != q.rightMargin {
-		copy(q.array, oldArray[:q.rightMargin])
+		copy(q.array, oldArray[:q.rightMargin]) // 把旧 ringbuffer 的数据拷贝到新 ringbuffer
 
-		if q.tail <= q.head {
+		if q.tail <= q.head { // 回绕场景扩容如图所示： https://user-images.githubusercontent.com/10202906/253150254-67d9ae6e-83d2-455d-b617-2f46e0e981c2.png
 			if q.tail != q.head {
 				// created slice is slightly larger then need but this is fine after only the needed bytes are copied
-				q.push(make([]byte, q.head-q.tail), q.head-q.tail)
+				q.push(make([]byte, q.head-q.tail), q.head-q.tail) // 填充 q.head-q.tail 个空字符 slice，主要是为了将 tail 指针移动到跟 head 保持一致
 			}
 
 			q.head = leftMarginIndex
@@ -139,14 +140,19 @@ func (q *BytesQueue) allocateAdditionalMemory(minimum int) {
 	}
 }
 
+// #-----------------+------------+-------------+-------------+-------------+-----------------+
+// | variable buflen | timestamp  |     hash    |  key length |     key     |      entry      |
+// #-----------------+------------+-------------+-------------+-------------+-----------------+
+// |      1-5        |     8      |      8      |      2      |   len(key)  |     len(entry)  |
+// #-----------------+------------+-------------+-------------+-------------+-----------------+
 func (q *BytesQueue) push(data []byte, len int) {
 	headerEntrySize := binary.PutUvarint(q.headerBuffer, uint64(len))
-	q.copy(q.headerBuffer, headerEntrySize)
+	q.copy(q.headerBuffer, headerEntrySize) // 写入变长的数据长度
 
-	q.copy(data, len-headerEntrySize)
+	q.copy(data, len-headerEntrySize) // 写入数据
 
 	if q.tail > q.head {
-		q.rightMargin = q.tail
+		q.rightMargin = q.tail // 移动 rightMargin 指针指向 tail
 	}
 	if q.tail == q.head {
 		q.full = true
@@ -161,18 +167,18 @@ func (q *BytesQueue) copy(data []byte, len int) {
 
 // Pop reads the oldest entry from queue and moves head pointer to the next one
 func (q *BytesQueue) Pop() ([]byte, error) {
-	data, blockSize, err := q.peek(q.head)
+	data, blockSize, err := q.peek(q.head) // NOTE: head 指针指向的数据不一定是最旧的，因为存在数据扩容的情况
 	if err != nil {
 		return nil, err
 	}
 
-	q.head += blockSize
+	q.head += blockSize // 移动 head 指针指向下一个 entry
 	q.count--
 
 	if q.head == q.rightMargin {
 		q.head = leftMarginIndex
-		if q.tail == q.rightMargin {
-			q.tail = leftMarginIndex
+		if q.tail == q.rightMargin { // 说明数据已经被删完了
+			q.tail = leftMarginIndex // 直接将 head 和 tail 指针指向 leftMargin
 		}
 		q.rightMargin = q.tail
 	}
@@ -238,7 +244,7 @@ func (q *BytesQueue) peek(index int) ([]byte, int, error) {
 		return nil, 0, err
 	}
 
-	blockSize, n := binary.Uvarint(q.array[index:])
+	blockSize, n := binary.Uvarint(q.array[index:]) // 前面 n 个字节存储的是 entry size 的变长编码, 即 blockSize 即为数据长度
 	return q.array[index+n : index+int(blockSize)], int(blockSize), nil
 }
 
@@ -250,6 +256,7 @@ func (q *BytesQueue) canInsertAfterTail(need int) bool {
 	if q.tail >= q.head {
 		return q.capacity-q.tail >= need
 	}
+	// 当 q.tail < q.head 时，分为下面几种情况:
 	// 1. there is exactly need bytes between head and tail, so we do not need
 	// to reserve extra space for a potential empty entry when realloc this queue
 	// 2. still have unused space between tail and head, then we must reserve
@@ -265,5 +272,6 @@ func (q *BytesQueue) canInsertBeforeHead(need int) bool {
 	if q.tail >= q.head {
 		return q.head-leftMarginIndex == need || q.head-leftMarginIndex >= need+minimumHeaderSize
 	}
+	// 当 q.tail < q.head 时
 	return q.head-q.tail == need || q.head-q.tail >= need+minimumHeaderSize
 }

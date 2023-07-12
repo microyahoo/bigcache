@@ -16,10 +16,10 @@ type Metadata struct {
 }
 
 type cacheShard struct {
-	hashmap     map[uint64]uint32
-	entries     queue.BytesQueue
+	hashmap     map[uint64]uint32 // hashKey -> ringbuffer index
+	entries     queue.BytesQueue  // ringbuffer
 	lock        sync.RWMutex
-	entryBuffer []byte
+	entryBuffer []byte // 用于对象复用
 	onRemove    onRemoveCallback
 
 	isVerbose    bool
@@ -66,7 +66,7 @@ func (s *cacheShard) get(key string, hashedKey uint64) ([]byte, error) {
 		s.lock.RUnlock()
 		return nil, err
 	}
-	if entryKey := readKeyFromEntry(wrappedEntry); key != entryKey {
+	if entryKey := readKeyFromEntry(wrappedEntry); key != entryKey { // hash 冲突
 		s.lock.RUnlock()
 		s.collision()
 		if s.isVerbose {
@@ -122,9 +122,9 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 
 	s.lock.Lock()
 
-	if previousIndex := s.hashmap[hashedKey]; previousIndex != 0 {
-		if previousEntry, err := s.entries.Get(int(previousIndex)); err == nil {
-			resetHashFromEntry(previousEntry)
+	if previousIndex := s.hashmap[hashedKey]; previousIndex != 0 { // 根据 hash 值获取其在 ringbuffer 中的 index
+		if previousEntry, err := s.entries.Get(int(previousIndex)); err == nil { // 如果存在则先删除
+			resetHashFromEntry(previousEntry) // 将 entry 的 hash 置为0，即将 entry[8:16] 部分写入 0
 			//remove hashkey
 			delete(s.hashmap, hashedKey)
 		}
@@ -132,11 +132,11 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 
 	if !s.cleanEnabled {
 		if oldestEntry, err := s.entries.Peek(); err == nil {
-			s.onEvict(oldestEntry, currentTimestamp, s.removeOldestEntry)
+			s.onEvict(oldestEntry, currentTimestamp, s.removeOldestEntry) // 删除过期的数据
 		}
 	}
 
-	w := wrapEntry(currentTimestamp, hashedKey, key, entry, &s.entryBuffer)
+	w := wrapEntry(currentTimestamp, hashedKey, key, entry, &s.entryBuffer) // encode 需要写入 ringbuffer 的条目
 
 	for {
 		if index, err := s.entries.Push(w); err == nil {
@@ -144,7 +144,8 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 			s.lock.Unlock()
 			return nil
 		}
-		if s.removeOldestEntry(NoSpace) != nil {
+		// 如果插入失败了，bigCache 会将 BytesQueue 的头部数据删除掉，尝试通过删除已插入的数据来解决因 BytesQueue 存储不足而插入失败的情况，然后重新尝试 BytesQueue.Push 操作（for 循环）
+		if s.removeOldestEntry(NoSpace) != nil { // 空间不足，移除 oldest entry
 			s.lock.Unlock()
 			return fmt.Errorf("entry is bigger than max shard size")
 		}
@@ -253,19 +254,19 @@ func (s *cacheShard) del(hashedKey uint64) error {
 			return ErrEntryNotFound
 		}
 
-		wrappedEntry, err := s.entries.Get(int(itemIndex))
+		wrappedEntry, err := s.entries.Get(int(itemIndex)) // 从 ringbuffer 里获取编码过的 entry
 		if err != nil {
 			s.lock.Unlock()
 			s.delmiss()
 			return err
 		}
 
-		delete(s.hashmap, hashedKey)
-		s.onRemove(wrappedEntry, Deleted)
+		delete(s.hashmap, hashedKey)      // 从 map 中移除 hash key
+		s.onRemove(wrappedEntry, Deleted) // 执行删除回调函数
 		if s.statsEnabled {
 			delete(s.hashmapStats, hashedKey)
 		}
-		resetHashFromEntry(wrappedEntry)
+		resetHashFromEntry(wrappedEntry) // 将 entry 的 hash 值设置为 0
 	}
 	s.lock.Unlock()
 
@@ -275,7 +276,7 @@ func (s *cacheShard) del(hashedKey uint64) error {
 
 func (s *cacheShard) onEvict(oldestEntry []byte, currentTimestamp uint64, evict func(reason RemoveReason) error) bool {
 	if s.isExpired(oldestEntry, currentTimestamp) {
-		evict(Expired)
+		evict(Expired) // 删除 oldest 条目
 		return true
 	}
 	return false
@@ -286,7 +287,7 @@ func (s *cacheShard) isExpired(oldestEntry []byte, currentTimestamp uint64) bool
 	if currentTimestamp <= oldestTimestamp { // if currentTimestamp < oldestTimestamp, the result will out of uint64 limits;
 		return false
 	}
-	return currentTimestamp-oldestTimestamp > s.lifeWindow
+	return currentTimestamp-oldestTimestamp > s.lifeWindow // 如果 当前时间-写入时间>lifeWindow，说明过期
 }
 
 func (s *cacheShard) cleanUp(currentTimestamp uint64) {
@@ -335,8 +336,8 @@ func (s *cacheShard) removeOldestEntry(reason RemoveReason) error {
 			// entry has been explicitly deleted with resetHashFromEntry, ignore
 			return nil
 		}
-		delete(s.hashmap, hash)
-		s.onRemove(oldest, reason)
+		delete(s.hashmap, hash)    // 从 map 中移除 hash key
+		s.onRemove(oldest, reason) // 删除时调用回调函数
 		if s.statsEnabled {
 			delete(s.hashmapStats, hash)
 		}
@@ -438,7 +439,7 @@ func initNewShard(config Config, callback onRemoveCallback, clock clock) *cacheS
 		bytesQueueInitialCapacity = maximumShardSizeInBytes
 	}
 	return &cacheShard{
-		hashmap:      make(map[uint64]uint32, config.initialShardSize()),
+		hashmap:      make(map[uint64]uint32, config.initialShardSize()), // 条目个数
 		hashmapStats: make(map[uint64]uint32, config.initialShardSize()),
 		entries:      *queue.NewBytesQueue(bytesQueueInitialCapacity, maximumShardSizeInBytes, config.Verbose),
 		entryBuffer:  make([]byte, config.MaxEntrySize+headersSizeInBytes),
